@@ -163,186 +163,112 @@ ros2 topic pub --once /main/normal std_msgs/msg/Empty "{}"
 
 ### 5.0 전체 플로우 차트 (Mermaid)
 
+#### (1) 초기화 + 메인 루프 + ROS2 이벤트
+ROS2 콜백은 별도 스레드에서 이벤트를 `EventQueue`에 넣기만 하고, 실제 상태 전이는 메인 루프에서 처리합니다.
+
 ```mermaid
 flowchart TD
-  %% =========================
-  %% Integrated Warehouse Supervisor v6 - Detailed Flow
-  %% =========================
-
   classDef topic fill:#eef,stroke:#55f,stroke-width:1px,color:#111;
-  classDef state fill:#efe,stroke:#2a2,stroke-width:1px,color:#111;
+  classDef normal fill:#efe,stroke:#2a2,stroke-width:1px,color:#111;
   classDef danger fill:#fee,stroke:#f55,stroke-width:1px,color:#111;
   classDef io fill:#fff7e6,stroke:#f0a,stroke-width:1px,color:#111;
 
-  %% ---------- BOOT ----------
-  A([Start: ./python.sh integrated_warehouse_supervisor_v6.py]) --> B[Parse CLI args<br/>--map-yaml, --env-usd, topic names]
-  B --> C[Load map.yaml + map.png<br/>Occupancy grid for planning]:::io
-  C --> D[Open USD Stage: basic12.usd (env)]:::io
-  D --> E{Find required prims?}
-  E -- "No" --> E1([Exit with error<br/>missing /World/Drone_Group/.../cf2x etc.]):::danger
-  E -- "Yes" --> F[Init ROS2 bridge (rclpy)<br/>Create publishers/subscribers]:::io
-  F --> G[Init modules<br/>GasSimulator / IncidentManager / DroneController / MobileController]:::io
-  G --> H([Main Loop: physics step / tick]):::state
+  S0(["./python.sh integrated_warehouse_supervisor_v6.py"]) --> S1["parse_args()"]
+  S1 --> S2["map.yaml + map.png 로드<br/>점유격자 inflate"]:::io
+  S2 --> S3["basic12.usd 스테이지 열기 (--env-usd)"]:::io
+  S3 --> S4["custom_mobile.usd 로봇 추가"]:::io
+  S4 --> S5{"드론 프림 존재?<br/>/World/Drone_Group/.../cf2x"}
+  S5 -- "아니오" --> SX(["종료"]):::danger
+  S5 -- "예" --> S6["좌/우 카메라 annotator 연결<br/>world.reset + timeline play"]
+  S6 --> S7["ROS2 노드 스레드 시작"]:::io
+  S7 --> L0
 
-  %% ---------- ROS IO ----------
-  subgraph ROS2_Interface[ROS2 Interface]
+  subgraph LOOP["메인 루프 (매 physics step)"]
     direction TB
-    T1[/SUB: /main/gas_start String/]:::topic
-    T2[/SUB: /main/normal Empty/]:::topic
-    T3[/SUB: /incident/isolation_done_a Bool/]:::topic
-    T4[/SUB: /incident/isolation_done_b Bool/]:::topic
-    T5[/SUB: /incident/isolation_done_c Bool/]:::topic
-    T6[/SUB: /incident/isolation_done_d Bool/]:::topic
-
-    P1[/PUB: /main/gas_location String "x y yaw"/]:::topic
-    P2[/PUB: /main/mobile_arrived Empty/]:::topic
-    P3[/PUB: /main/mobile_done Empty/]:::topic
-    P4[/PUB: /drone/barcode_data String/]:::topic
-    P5[/PUB: /drone/gas_ppm String/]:::topic
-    P6[/PUB: /hazard/shutter_cmd_1..4 Bool/]:::topic
-    P7[/PUB: /valve/*_angle_deg Float32/]:::topic
-    P8[/PUB: /hazmat/gas_fixed_*_ppm Float32/]:::topic
-    P9[/PUB: /hazard/fsm_state_code_* Int32/]:::topic
+    L0(["world.step()"]):::normal
+    L1["gas_sim.update()"]
+    L2["주기 발행<br/>0.1s: gas ppm 토픽<br/>1s: FSM 코드 / 셔터 / 밸브 각도"]:::topic
+    L3{"WAIT_NORMAL 이고<br/>사고 구역 ppm ≈ 0 ?"}
+    L3a["EvNormal 자동 푸시"]
+    L4["EventQueue 처리"]
+    L5["모바일 FSM 1스텝"]
+    L6["드론 FSM 1스텝"]
+    L0 --> L1 --> L2 --> L3
+    L3 -- "예" --> L3a --> L4
+    L3 -- "아니오" --> L4
+    L4 --> L5 --> L6 --> L0
   end
 
-  %% Tie ROS triggers to main loop managers (dashed: async callbacks)
-  T1 -.-> IM_EVT[Callback: GasStart received]:::danger
-  T2 -.-> IM_NORM[Callback: Normal received]:::topic
-  T3 -.-> IM_ISO_A[Callback: isolation_done_a]:::topic
-  T4 -.-> IM_ISO_B[Callback: isolation_done_b]:::topic
-  T5 -.-> IM_ISO_C[Callback: isolation_done_c]:::topic
-  T6 -.-> IM_ISO_D[Callback: isolation_done_d]:::topic
-
-  %% ---------- MANAGERS ----------
-  subgraph Managers[Per-tick Managers (called from Main Loop)]
+  subgraph ROS["ROS2 콜백 (별도 스레드) → EventQueue"]
     direction LR
-    IM[IncidentManager FSM]:::state
-    GS[GasSimulator]:::state
-    DR[Drone FSM]:::state
-    MB[Mobile FSM]:::state
+    R1["/main/gas_start<br/>A~D 중 랜덤 구역 선택"]:::topic
+    R2["/main/gas_location<br/>'x y yaw' 파싱"]:::topic
+    R3["/incident/isolation_done_a~d<br/>True 일 때만"]:::topic
+    R4["/main/normal"]:::topic
   end
 
-  H --> IM
-  H --> GS
-  H --> DR
-  H --> MB
-
-  %% ---------- INCIDENT MANAGER FSM ----------
-  subgraph IncidentFSM[IncidentManager (High-level) FSM]
-    direction TB
-
-    I0([NORMAL / IDLE]):::state
-    I1([INCIDENT_SELECTED<br/>zone=A|B|C|D]):::danger
-    I2([DISPATCH_DRONE<br/>override → incident point]):::danger
-    I3([WAIT_DRONE_ARRIVAL]):::danger
-    I4([DISPATCH_MOBILE<br/>publish /main/gas_location]):::danger
-    I5([WAIT_MOBILE_ARRIVAL]):::danger
-    I6([VALVE_SEQUENCE_RUNNING]):::danger
-    I7([WAIT_ISOLATION_DONE<br/>or TIMEOUT]):::danger
-    I8([RAMP_DOWN_GAS]):::danger
-    I9([WAIT_NORMAL_CONDITION<br/>ppm→0 OR /main/normal]):::state
-    I10([RESET & RETURN_TO_PATROL]):::state
-  end
-
-  %% Incident transitions
-  IM --> I0
-  IM_EVT --> I1
-  I0 -->|on /main/gas_start| I1
-  I1 --> I2
-  I2 --> I3
-  I3 -->|drone reached incident| I4
-  I4 -->|PUB gas_location| P1
-  I4 --> I5
-  I5 -->|mobile arrived| I6
-  I6 -->|mobile seq finished| I7
-  I7 -->|isolation_done OR timeout| I8
-  I8 --> I9
-  I9 -->|ppm==0| I10
-  I9 -->|on /main/normal| I10
-  I10 --> I0
-
-  %% Update visual/state topics during incident (representative)
-  I1 -->|set fsm_state_code=1| P9
-  I6 -->|set fsm_state_code=2| P9
-  I7 -->|set fsm_state_code=3| P9
-  I6 -->|shutter TRUE by zone| P6
-  I6 -->|valve angle updates| P7
-  I1 -->|gas ppm publish loop| P5
-  I8 -->|gas ppm/ppm_fixed publish loop| P8
-
-  %% ---------- GAS SIMULATOR ----------
-  subgraph GasSimulatorFlow[GasSimulator]
-    direction TB
-    G0([Idle ppm=0]):::state
-    G1([Leak Active<br/>ppm increases]):::danger
-    G2([Ramp Down<br/>ppm → 0 in N seconds]):::state
-  end
-
-  GS --> G0
-  I1 -->|trigger_leak(zone)| G1
-  I8 -->|start_ramp_down(zone)| G2
-  G1 -->|PUB ppm values| P8
-  G2 -->|PUB ppm values| P8
-  G1 -->|status text| P5
-  G2 -->|status text| P5
-  G2 -->|ppm==0| I9
-
-  %% ---------- DRONE FSM ----------
-  subgraph DroneFSM[DroneController FSM]
-    direction TB
-    D0([PATROL_ROUTE<br/>scan points]):::state
-    D1([SCAN_BARCODES<br/>left/right camera]):::state
-    D2([OVERRIDE_TO_INCIDENT<br/>go to incident waypoint]):::danger
-    D3([ARRIVED_AT_INCIDENT]):::danger
-    D4([RETURN_TO_PATROL]):::state
-  end
-
-  DR --> D0
-  D0 --> D1
-  D1 -->|decode success| P4
-  D1 --> D0
-
-  I2 -->|set override target| D2
-  D2 -->|reach target| D3
-  D3 -->|notify IncidentManager| I3
-  I10 --> D4
-  D4 --> D0
-
-  %% ---------- MOBILE FSM ----------
-  subgraph MobileFSM[MobileController FSM]
-    direction TB
-    M0([PATROL<br/>random adjacent waypoints]):::state
-    M1([RECEIVE_TARGET<br/>/main/gas_location]):::danger
-    M2([PLAN_PATH<br/>A* on occupancy]):::danger
-    M3([NAVIGATE<br/>A* + reactive avoid]):::danger
-    M4([ARRIVED]):::danger
-    M5([VALVE_SEQUENCE<br/>APPROACH→GRIP_CLOSE→TURN→GRIP_OPEN→HOME]):::danger
-    M6([RETURN_TO_PATROL_POINT]):::state
-  end
-
-  MB --> M0
-  P1 -.-> M1
-
-  M1 --> M2
-  M2 --> M3
-  M3 -->|reach tolerance| M4
-  M4 -->|PUB mobile_arrived| P2
-  M4 -->|notify IncidentManager| I5
-  M4 --> M5
-  M5 -->|TURN updates valve state| P7
-  M5 -->|finish| P3
-  M5 -->|notify IncidentManager| I6
-  I10 --> M6
-  M6 --> M0
-
-  %% ---------- Isolation Done signals to Incident FSM ----------
-  IM_ISO_A -.-> I7
-  IM_ISO_B -.-> I7
-  IM_ISO_C -.-> I7
-  IM_ISO_D -.-> I7
-  I7 -->|if timeout| I8
+  R1 -.->|EvGasStart| L4
+  R2 -.->|EvGasLocation| L4
+  R3 -.->|EvIsolationDone| L4
+  R4 -.->|EvNormal| L4
 ```
 
+#### (2) 모바일 매니퓰레이터 FSM (`mobile_state`)
+`FSM 코드`는 `/hazard/fsm_state_code_<zone>`으로 발행되는 값입니다(1 사고 발생, 2 작업 중, 3 작업 완료, 4 평상시).
+
+```mermaid
+flowchart TD
+  classDef topic fill:#eef,stroke:#55f,stroke-width:1px,color:#111;
+  classDef normal fill:#efe,stroke:#2a2,stroke-width:1px,color:#111;
+  classDef danger fill:#fee,stroke:#f55,stroke-width:1px,color:#111;
+
+  M0(["PATROL<br/>순찰점 사이 인접 랜덤 이동"]):::normal
+  M1(["STOPPED<br/>제자리 정지"]):::danger
+  M2(["GO_TO_TARGET<br/>A* + Reactive 주행"]):::danger
+  M4(["WAIT_NORMAL<br/>가스 램프다운 대기"]):::danger
+  M5(["RETURN_TO_PATROL<br/>가장 가까운 순찰점으로"]):::normal
+
+  M0 -->|"EvGasStart<br/>가스 누출 시작, FSM 코드 1"| M1
+  M1 -->|EvGasLocation| M2
+  M2 -->|"목표 도달<br/>/main/mobile_arrived 발행<br/>셔터 ON, FSM 코드 2"| A1
+
+  subgraph TASK["TASK: 밸브 조작 시퀀스 (선형 보간)"]
+    direction TB
+    A1["APPROACH 2s"] --> A2["GRIP_CLOSE 1s"] --> A3["TURN 2s<br/>밸브 상태 = VALVE_CLOSE"] --> A4["GRIP_OPEN 1s"] --> A5["HOME 2s"] --> A6{"WAIT_AG_DONE<br/>isolation_done 수신<br/>또는 15s 초과?"}
+    A6 -- "아니오" --> A6
+  end
+
+  A6 -->|"예<br/>/main/mobile_done 발행<br/>램프다운 8s 시작, FSM 코드 3"| M4
+  M4 -->|"EvNormal (ppm ≈ 0 자동 또는 /main/normal)<br/>가스/밸브/셔터 초기화, FSM 코드 4"| M5
+  M1 -->|EvNormal| M5
+  M5 -->|순찰점 도달| M0
+```
+
+#### (3) 드론 FSM (`drone_state['mode']`)
+드론이 발행한 `/main/gas_location`은 같은 노드가 다시 구독하여 모바일의 `EvGasLocation`이 됩니다.
+
+```mermaid
+flowchart TD
+  classDef topic fill:#eef,stroke:#55f,stroke-width:1px,color:#111;
+  classDef normal fill:#efe,stroke:#2a2,stroke-width:1px,color:#111;
+  classDef danger fill:#fee,stroke:#f55,stroke-width:1px,color:#111;
+
+  D0(["patrol<br/>DRONE_SCAN_LOCATIONS 순회"]):::normal
+  D1["스캔 슬롯 도착 → 3초 호버링<br/>좌/우 카메라 바코드 스캔"]
+  P1["/drone/barcode_data<br/>'slot:text'"]:::topic
+  D2(["override step 0<br/>고도 7m 상승"]):::danger
+  D3(["override step 1<br/>사고 지점으로 이동"]):::danger
+  D4(["override step 2<br/>호버링 유지"]):::danger
+  P2["/main/gas_location 1회 발행<br/>DISPATCH_POINTS 좌표"]:::topic
+
+  D0 --> D1
+  D1 -.->|디코딩 성공| P1
+  D1 -->|다음 위치| D0
+  D0 -->|EvGasStart| D2
+  D2 --> D3 --> D4
+  D4 -.-> P2
+  D4 -->|EvNormal| D0
+```
 
 ### 5.1 큰 흐름
 1) **평상시**
